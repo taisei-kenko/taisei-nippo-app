@@ -1,55 +1,18 @@
 /* global google */
 (function () {
   'use strict';
-  const cfg = window.TAISEI_GOOGLE_DRIVE_CONFIG || {};
-  const scope = 'https://www.googleapis.com/auth/drive.file';
-  const status = document.getElementById('confirmError');
-  const original = document.getElementById('save');
-  const dialog = document.getElementById('dialog');
-  const pendingKey = 'taisei-google-drive-pending-v1';
-  const approvedKey = 'taisei-google-drive-approved-v1';
-  let sending = false, tokenClient;
-  const ready = () => cfg.clientId && !cfg.clientId.includes('PASTE-') && window.google?.accounts?.oauth2;
-  const show = text => { status.textContent = text; };
-  const escapeQuery = text => String(text).replace(/'/g,"\\'");
-  const fileName = () => `daily-${new Date().toISOString().replace(/[:.]/g,'-')}-${crypto.randomUUID ? crypto.randomUUID() : Date.now()}.json`;
-  async function api(path, options={}) {
-    const response = await fetch(`https://www.googleapis.com/drive/v3/${path}`, {headers:{Authorization:`Bearer ${window.__taiseiGoogleToken}`,...(options.headers||{})},...options});
-    if (!response.ok) throw new Error(`Google Driveへの送信に失敗しました（${response.status}）。`);
-    return response.status===204 ? null : response.json();
-  }
-  async function findOrCreateFolder(name, parent) {
-    const q=[`name='${escapeQuery(name)}'`,`mimeType='application/vnd.google-apps.folder'`,`trashed=false`]; if(parent) q.push(`'${parent}' in parents`);
-    const found=await api(`files?q=${encodeURIComponent(q.join(' and '))}&fields=files(id,name)&pageSize=10`);
-    if(found.files?.length) return found.files[0].id;
-    const body={name,mimeType:'application/vnd.google-apps.folder'}; if(parent) body.parents=[parent];
-    const response=await fetch('https://www.googleapis.com/drive/v3/files?fields=id',{method:'POST',headers:{Authorization:`Bearer ${window.__taiseiGoogleToken}`,'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(!response.ok) throw new Error(`日報フォルダーを作成できませんでした（${response.status}）。`); return (await response.json()).id;
-  }
-  async function upload(payload) {
-    const root=await findOrCreateFolder(cfg.rootFolderName); const incoming=await findOrCreateFolder(cfg.incomingFolderName,root);
-    const metadata=new Blob([JSON.stringify({name:fileName(),parents:[incoming],mimeType:'application/json'})],{type:'application/json'});
-    const content=new Blob([JSON.stringify(payload,null,2)+'\n'],{type:'application/json'});
-    const form=new FormData(); form.append('metadata',metadata); form.append('file',content);
-    const response=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name',{method:'POST',headers:{Authorization:`Bearer ${window.__taiseiGoogleToken}`},body:form});
-    if(!response.ok) throw new Error(`JSONを送信できませんでした（${response.status}）。`);
-    sessionStorage.removeItem(pendingKey); show('送信完了：WindowsのGoogle Drive同期後に日報へ反映されます。'); dialog.close();
-  }
-  function requestToken(payload) {
-    tokenClient=google.accounts.oauth2.initTokenClient({client_id:cfg.clientId,scope,callback:async response=>{
-      if(response.error) { show('Google認証に失敗しました。入力内容は残っています。再送できます。'); sending=false; button.disabled=false; return; }
-      window.__taiseiGoogleToken=response.access_token;
-      localStorage.setItem(approvedKey, '1');
-      try { await upload(payload); } catch(e) { show(`${e.message} 入力内容は残っています。再送できます。`); }
-      finally { sending=false; button.disabled=false; }
-    }});
-    tokenClient.requestAccessToken({prompt: (window.__taiseiGoogleToken || localStorage.getItem(approvedKey)) ? '' : 'consent'});
-  }
-  const button=original.cloneNode(true); original.replaceWith(button);
-  button.addEventListener('click',()=>{
-    let payload; try { payload=JSON.parse(document.getElementById('json').textContent); } catch { show('送信する日報を確認できません。'); return; }
-    sessionStorage.setItem(pendingKey,JSON.stringify(payload));
-    if(!ready()) { show('Google連携の設定または通信が未完了です。app-config.jsを確認して再送してください。'); return; }
-    if(sending) return; sending=true; button.disabled=true; show('Googleに接続しています…'); requestToken(payload);
-  });
+  const cfg=window.TAISEI_GOOGLE_DRIVE_CONFIG||{}, scope='https://www.googleapis.com/auth/drive.file';
+  const status=document.getElementById('confirmError'), original=document.getElementById('save'), dialog=document.getElementById('dialog');
+  const pendingKey='taisei-google-drive-pending-v1', approvedKey='taisei-google-drive-approved-v1';
+  let sending=false, releaseTimer=0;
+  const show=t=>{status.textContent=t;}; const configured=()=>cfg.clientId&&!cfg.clientId.includes('PASTE-');
+  const esc=t=>String(t).replace(/'/g,"\\'"); const filename=()=>`daily-${new Date().toISOString().replace(/[:.]/g,'-')}-${crypto.randomUUID?crypto.randomUUID():Date.now()}.json`;
+  const button=original.cloneNode(true); button.textContent='日報を送信'; original.replaceWith(button);
+  function finish(message){clearTimeout(releaseTimer);releaseTimer=0;sending=false;button.disabled=false;if(message)show(message);}
+  function waitForGis(){return new Promise((resolve,reject)=>{const start=Date.now(),timer=setInterval(()=>{if(window.google?.accounts?.oauth2){clearInterval(timer);resolve();}else if(Date.now()-start>10000){clearInterval(timer);reject(new Error('Google認証の読み込みに失敗しました。通信を確認して再送してください。'));}},100);});}
+  async function api(path,options={}){const r=await fetch(`https://www.googleapis.com/drive/v3/${path}`,{headers:{Authorization:`Bearer ${window.__taiseiGoogleToken}`,...(options.headers||{})},...options});if(!r.ok)throw new Error(`Google Driveへの送信に失敗しました（${r.status}）。`);return r.status===204?null:r.json();}
+  async function folder(name,parent){const q=[`name='${esc(name)}'`,"mimeType='application/vnd.google-apps.folder'",'trashed=false'];if(parent)q.push(`'${parent}' in parents`);const found=await api(`files?q=${encodeURIComponent(q.join(' and '))}&fields=files(id,name)&pageSize=10`);if(found.files?.length)return found.files[0].id;const body={name,mimeType:'application/vnd.google-apps.folder'};if(parent)body.parents=[parent];const r=await fetch('https://www.googleapis.com/drive/v3/files?fields=id',{method:'POST',headers:{Authorization:`Bearer ${window.__taiseiGoogleToken}`,'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error(`日報フォルダーを作成できませんでした（${r.status}）。`);return (await r.json()).id;}
+  async function upload(payload){const root=await folder(cfg.rootFolderName), incoming=await folder(cfg.incomingFolderName,root), form=new FormData();form.append('metadata',new Blob([JSON.stringify({name:filename(),parents:[incoming],mimeType:'application/json'})],{type:'application/json'}));form.append('file',new Blob([JSON.stringify(payload,null,2)+'\n'],{type:'application/json'}));const r=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name',{method:'POST',headers:{Authorization:`Bearer ${window.__taiseiGoogleToken}`},body:form});if(!r.ok)throw new Error(`JSONを送信できませんでした（${r.status}）。`);sessionStorage.removeItem(pendingKey);finish('送信完了：WindowsのGoogle Drive同期後に日報へ反映されます。');dialog.close();}
+  async function requestToken(payload){await waitForGis();const client=google.accounts.oauth2.initTokenClient({client_id:cfg.clientId,scope,callback:async r=>{if(r.error){finish('Google認証に失敗しました。入力内容は残っています。再送できます。');return;}window.__taiseiGoogleToken=r.access_token;localStorage.setItem(approvedKey,'1');try{await upload(payload);}catch(e){finish(`${e.message||'送信に失敗しました。'} 入力内容は残っています。再送できます。`);}},error_callback:()=>finish('Google認証画面を開けませんでした。ポップアップを許可して再送してください。')});client.requestAccessToken({prompt:(window.__taiseiGoogleToken||localStorage.getItem(approvedKey))?'':'select_account'});}
+  button.addEventListener('click',async()=>{if(sending)return;let payload;try{payload=JSON.parse(document.getElementById('json').textContent);}catch{show('送信する日報を確認できません。');return;}if(!configured()){show('Google連携の設定が未完了です。管理者へ連絡してください。');return;}sessionStorage.setItem(pendingKey,JSON.stringify(payload));sending=true;button.disabled=true;show('Google認証を開始しています…');releaseTimer=setTimeout(()=>finish('Google認証の応答がありません。通信とポップアップ設定を確認して再送してください。'),30000);try{await requestToken(payload);}catch(e){finish(`${e.message||'Google認証を開始できません。'} 入力内容は残っています。再送できます。`);}});
 }());
